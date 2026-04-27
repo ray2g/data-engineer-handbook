@@ -1,0 +1,213 @@
+# ═══════════════════════════════════════════════════════════════════
+# Train Experiment — qplanner SAC TMC (EBM Regressor)
+# ═══════════════════════════════════════════════════════════════════
+# Experiment: qplanner_sac_tmc_models  |  Run: v1.0.0
+# Date range: 20250919 → 20260127
+# Platform  : Dataproc Batch (Docker image)
+# ───────────────────────────────────────────────────────────────────
+
+# Task type: "regression" or "classification"
+task: regression
+
+# Default model identifier — must match a key under optimization.models.
+default_model: ebm_regressor       # Default model used across pipeline stages (ebm_regressor, ebm_classifier, lgbm_regressor, lgbm_classifier)
+
+# Used to query the input data from training panel: time window covering training and test data. Must be in YYYYMMDD format.
+start_training_date: "20250919"
+end_training_date: "20260127"
+
+# ── 0. Columns ───────────────────────────────────────────────
+# Central column definitions — used across all pipeline stages.
+columns:
+  target: target_value
+  date: reference_date
+  id: contract_id
+
+  drop_cols:
+    - internal_key
+    - raw_flag
+
+  categorical:
+    - intention_type
+    - equipment_category
+    - invoice_segment
+
+# ── 1. Data Loading ──────────────────────────────────────────
+data_loading:
+  query: |
+    SELECT *
+    FROM `project.dataset.qplanner_sac_tmc_panel`
+    WHERE reference_date BETWEEN '{start_training_date}' AND '{end_training_date}'
+
+  test_size: 0.2
+  random_state: 42
+  local_path: ""
+  log_target: false
+
+# ── 2. Feature Engineering ────────────────────────────────────
+transform_features:
+  enable: true
+
+  steps:
+    - name: days_to_expiry
+      type: date_diff
+      start_col: reference_date
+      end_col: expiry_date
+      unit: days
+
+    - name: invoice_ratio
+      type: ratio
+      numerator: invoice_amount
+      denominator: contract_value
+      fill_value: 0.0
+
+    - name: equipment_count_log
+      type: log1p
+      source: equipment_count
+
+    - name: intention_type_encoded
+      type: one_hot
+      source: intention_type
+      drop_first: true
+
+    - name: equipment_category_encoded
+      type: one_hot
+      source: equipment_category
+      drop_first: true
+
+# ── 3. Feature Selection ─────────────────────────────────────
+# enable: true  → run the automated pipeline (steps below)
+# enable: false → use only predefined_features list
+feature_selection:
+  enable: true
+  # Manual list of features (used when enable: false)
+  # If empty, all features selected in the last stage will be used
+  predefined_features: []
+
+  variance_threshold: 0.0
+
+  # Toggle each pipeline step on/off
+  steps:
+    correlation_elimination: true
+    boruta: true
+
+  # 3a. Correlation Elimination
+  correlation_elimination:
+    threshold: 0.95
+
+  # 3b. Boruta Feature Selection
+  boruta:
+    max_iter: 100
+    alpha: 0.05
+    model: null
+    n_estimators: 100
+    random_state: 42
+
+# ── 4. Optimization ──────────────────────────────────────────
+# default_model (above) selects which optimization.models entry to use.
+# Search spaces for hyperparameter tuning. Rarely needs editing.
+optimization:
+  enable: true                  # true = Optuna search; false = use pre_selected_params below
+  optuna_params:
+    n_trials: 80                # Number of Optuna trials
+    cv_splits: 5                # Cross-validation folds
+    direction: minimize
+    metric: rmse
+    timeout: null
+    n_jobs: 1
+    random_state: 42
+
+  pre_selected_params:
+    max_bins: 256
+    max_interaction_bins: 32
+    interactions: 10
+    learning_rate: 0.01
+    min_samples_leaf: 5
+
+  models:
+    ebm_regressor:
+      max_bins:              [128, 512]
+      max_interaction_bins:  [16, 64]
+      interactions:          [0, 15]
+      learning_rate:         [0.001, 0.1]
+      min_samples_leaf:      [2, 20]
+
+    ebm_classifier:
+      max_bins:              [128, 512]
+      max_interaction_bins:  [16, 64]
+      interactions:          [0, 15]
+      learning_rate:         [0.001, 0.1]
+      min_samples_leaf:      [2, 20]
+
+    lgbm_regressor:
+      num_leaves:          [20, 300]
+      learning_rate:       [0.01, 0.3]
+      min_child_samples:   [5, 100]
+      n_estimators:        [100, 1000]
+      subsample:           [0.5, 1.0]
+      colsample_bytree:    [0.5, 1.0]
+      reg_alpha:           [0.0, 1.0]
+      reg_lambda:          [0.0, 1.0]
+
+    lgbm_classifier:
+      num_leaves:          [20, 300]
+      learning_rate:       [0.01, 0.3]
+      min_child_samples:   [5, 100]
+      n_estimators:        [100, 1000]
+      subsample:           [0.5, 1.0]
+      colsample_bytree:    [0.5, 1.0]
+      reg_alpha:           [0.0, 1.0]
+      reg_lambda:          [0.0, 1.0]
+
+# ── 5. Training ───────────────────────────────────────────────
+# training.enable: false → skip training, evaluation and artifact saving entirely.
+# Useful when you only want to run feature selection.
+training:
+  enable: true
+
+# ── 6. Evaluation ─────────────────────────────────────────────────
+# evaluation.enable: false → skip metric computation and metrics saving.
+# evaluation.metrics: list of metrics to compute on the test set.
+#   Available regression metrics:     mae, mape, mse, medae, r2, rmse
+#   Available classification metrics: gini, f1, pr_auc, precision, recall, accuracy, log_loss
+evaluation:
+  enable: true
+  metrics: [mae, mape, mse, medae, r2, rmse]   # all regression metrics
+
+  # ── External Model Evaluation ──
+  # apply_expm1: null (default) inherits the pipeline's log_target setting.
+  #   Set to true/false to override per model.
+  external_models_evaluation:
+    enable: true                                                  # true = evaluate external models | false = skip
+    models:
+      - name: ebm_M1                                              # Label for this model (used as metric suffix)
+        path: "runs:/39391de82ae045df945eb73ad6def1ca/pipeline/"  # MLflow model URI
+        apply_expm1: null
+
+      - name: ebm_M2
+        path: "runs:/your_m2_run_id/pipeline/"
+        apply_expm1: null
+
+# ── 7. Feature Explainability ────────────────────────────────────
+feature_explainability:
+  ebm_html:
+    enable: true                                     # Set to false to skip EBM HTML dashboard
+    dashboard_title: "EBM Global Explainability"     # Title shown in the HTML dashboard
+    max_display_features: 20                         # Number of top features to export as individual HTML pages (0 = summary only)
+  shap:
+    enable: true                    # Set to false to skip SHAP explainability
+    bg_sample_size: 500             # Background samples for SHAP explainer baseline
+    test_sample_size: 5000          # Max test samples to explain (null = all)
+    max_display_features: 20        # Number of top features shown in both plots
+
+# ── 8. Output ────────────────────────────────────────────────────
+output:
+  mlflow:
+    enable: true                   # Set to false to skip MLflow logging entirely
+    experiment_version: "v1.0.0"
+    experiment_name: "qplanner_sac_tmc_models"
+    run_name: "qplanner_sac_tmc_ebm_20250919_20260427"
+    experiment_description: "EBM Model SAC TMC with intentions, equipments and invoice features. Compared to previous EBM (M1 & M2) versions. Note: run performed with Batch Dataproc Docker image."
+    artifact_path: "qp_sac_tmc_mdl"
+    register_model: true            # Set to false to skip MLflow Model Registry registration
+  log_file: "logs/training.log"

@@ -1,0 +1,264 @@
+# ═══════════════════════════════════════════════════════════════════
+# QPSACAT ML Library — Example Training Configuration
+# ═══════════════════════════════════════════════════════════════════
+# This file documents ALL available configuration options for the
+# training pipeline.  Copy it to your experiment folder, rename it
+# config.yaml, and customise the values for your run.
+#
+# Pipeline stages (each controlled by an `enable` flag):
+#   0. Columns          – central column registry
+#   1. Data Loading     – SQL query / local file
+#   2. Feature Engin.   – transform & create new features
+#   3. Feature Select.  – correlation elimination + Boruta
+#   4. Optimization     – Optuna hyperparameter search
+#   5. Training         – fit the selected model
+#   6. Evaluation       – metrics + external model comparison
+#   7. Explainability   – EBM HTML dashboard + SHAP plots
+#   8. Output           – MLflow experiment logging
+# ───────────────────────────────────────────────────────────────────
+
+# Task type: "regression" or "classification"
+task: regression
+
+# Default model key – must match an entry under optimization.models.
+# Used by all stages unless overridden locally.
+default_model: ebm_regressor       # Default model used across pipeline stages (ebm_regressor, ebm_classifier, lgbm_regressor, lgbm_classifier)
+
+# Used to query the input data from training panel: time window covering training and test data. Must be in YYYYMMDD format.
+start_training_date: "20250727"
+end_training_date: "20260427"
+
+# ── 0. Columns ───────────────────────────────────────────────
+# Central column definitions — used across all pipeline stages.
+columns:
+  target: target_value              # Column to predict (regression label or classification target)
+  date: reference_date              # Date column used for chronological train/test split
+  id: contract_id                   # Unique row identifier (excluded from features)
+
+  # Columns to drop before any modelling step (IDs, leakage, PII, etc.)
+  drop_cols:
+    - internal_key
+    - raw_flag
+
+  # Categorical columns — encoded automatically during preprocessing
+  categorical:
+    - category_a
+    - category_b
+
+# ── 1. Data Loading ──────────────────────────────────────────
+# Data is fetched via a BigQuery / Spark SQL query, or from a local
+# file for offline testing.
+data_loading:
+  # BigQuery / Spark SQL query used to retrieve the training dataset.
+  # The query must return a column for each entry in `columns` above.
+  query: |
+    SELECT *
+    FROM `project.dataset.training_panel`
+    WHERE reference_date BETWEEN '{start_training_date}' AND '{end_training_date}'
+
+  # Fraction reserved for the test set (chronological split on `columns.date`).
+  test_size: 0.2
+  random_state: 42
+
+  # Optional: path to a local CSV/Parquet file (overrides `query` when set).
+  # Leave blank ("") to always use the SQL query.
+  local_path: ""
+
+  # When true the target column is log-transformed (log1p) before training
+  # and inverse-transformed (expm1) after prediction.
+  log_target: false
+
+# ── 2. Feature Engineering ────────────────────────────────────
+# Controls the automated feature transformation stage.
+# Each step in `steps` defines a new derived feature or transformation.
+#
+# Steps are executed in order; later steps may reference columns
+# produced by earlier steps.
+transform_features:
+  enable: true
+
+  steps:
+    # ── Ratio features ──
+    - name: ratio_a_to_b
+      type: ratio
+      numerator: col_a
+      denominator: col_b
+      fill_value: 0.0           # Value when denominator is zero
+
+    # ── Date diff features ──
+    - name: days_since_event
+      type: date_diff
+      start_col: event_date
+      end_col: reference_date
+      unit: days
+
+    # ── Clip / cap features ──
+    - name: col_c_capped
+      type: clip
+      source: col_c
+      lower: 0.0
+      upper: 99.0
+
+    # ── Log transform ──
+    - name: col_d_log
+      type: log1p
+      source: col_d
+
+    # ── One-hot encode ──
+    - name: category_a_encoded
+      type: one_hot
+      source: category_a
+      drop_first: true
+
+# ── 3. Feature Selection ─────────────────────────────────────
+# enable: true  → run the automated pipeline (steps below)
+# enable: false → use only predefined_features list
+feature_selection:
+  enable: true
+  # Manual list of features (used when enable: false)
+  # If empty, all features selected in the last stage will be used
+  predefined_features: []
+
+  # Minimum variance filter – features with variance below this
+  # threshold are dropped before any other step.
+  variance_threshold: 0.0
+
+  # Toggle each pipeline step on/off
+  steps:
+    correlation_elimination: true
+    boruta: true
+
+  # 3a. Correlation Elimination
+  correlation_elimination:
+    # Maximum Pearson correlation allowed between any two features.
+    # When two features exceed this threshold, the one with lower
+    # correlation with the target is dropped.
+    threshold: 0.95
+
+  # 3b. Boruta Feature Selection
+  boruta:
+    # Total Boruta iterations.  Higher values → more stable results.
+    max_iter: 100
+    # Significance level for rejecting shadow features (0 < alpha <= 1).
+    alpha: 0.05
+    # Model used inside Boruta.  null = inherit default_model above.
+    model: null
+    # Number of estimators in the Random Forest used by Boruta.
+    n_estimators: 100
+    random_state: 42
+
+# ── 4. Optimization ──────────────────────────────────────────
+# default_model (above) selects which optimization.models entry to use.
+# Search spaces for hyperparameter tuning. Rarely needs editing.
+optimization:
+  enable: true                  # true = Optuna search; false = use pre_selected_params below
+  optuna_params:
+    n_trials: 80                # Number of Optuna trials
+    cv_splits: 5                # Cross-validation folds
+    direction: minimize         # "minimize" for regression errors, "maximize" for AUC/F1
+    metric: rmse                # Optimisation target (must be listed in evaluation.metrics)
+    timeout: null               # Optional wall-clock timeout in seconds (null = unlimited)
+    n_jobs: 1                   # Parallel Optuna workers (1 = sequential, safe on Dataproc)
+    random_state: 42
+
+  # Pre-selected hyperparameters used when enable: false.
+  # Must match the parameter names expected by the chosen model.
+  pre_selected_params:
+    max_bins: 256
+    max_interaction_bins: 32
+    interactions: 10
+    learning_rate: 0.01
+    min_samples_leaf: 5
+
+  # ── Per-model hyperparameter search spaces ────────────────
+  # Each key matches a `default_model` value.
+  # Each value is a dict of {param_name: [min, max]} for continuous
+  # params, or a list for categorical choices.
+  models:
+    ebm_regressor:
+      max_bins:              [128, 512]
+      max_interaction_bins:  [16, 64]
+      interactions:          [0, 15]
+      learning_rate:         [0.001, 0.1]
+      min_samples_leaf:      [2, 20]
+
+    ebm_classifier:
+      max_bins:              [128, 512]
+      max_interaction_bins:  [16, 64]
+      interactions:          [0, 15]
+      learning_rate:         [0.001, 0.1]
+      min_samples_leaf:      [2, 20]
+
+    lgbm_regressor:
+      num_leaves:          [20, 300]
+      learning_rate:       [0.01, 0.3]
+      min_child_samples:   [5, 100]
+      n_estimators:        [100, 1000]
+      subsample:           [0.5, 1.0]
+      colsample_bytree:    [0.5, 1.0]
+      reg_alpha:           [0.0, 1.0]
+      reg_lambda:          [0.0, 1.0]
+
+    lgbm_classifier:
+      num_leaves:          [20, 300]
+      learning_rate:       [0.01, 0.3]
+      min_child_samples:   [5, 100]
+      n_estimators:        [100, 1000]
+      subsample:           [0.5, 1.0]
+      colsample_bytree:    [0.5, 1.0]
+      reg_alpha:           [0.0, 1.0]
+      reg_lambda:          [0.0, 1.0]
+
+# ── 5. Training ───────────────────────────────────────────────
+# training.enable: false → skip training, evaluation and artifact saving entirely.
+# Useful when you only want to run feature selection.
+training:
+  enable: true
+
+# ── 6. Evaluation ─────────────────────────────────────────────────
+# evaluation.enable: false → skip metric computation and metrics saving.
+# evaluation.metrics: list of metrics to compute on the test set.
+#   Available regression metrics:     mae, mape, mse, medae, r2, rmse
+#   Available classification metrics: gini, f1, pr_auc, precision, recall, accuracy, log_loss
+evaluation:
+  enable: true
+  metrics: [mae, mape, mse, medae, r2, rmse]   # all regression metrics
+
+  # ── External Model Evaluation ──
+  # Load previously trained pipelines from MLflow and compare their
+  # test-set predictions against the newly trained model.
+  # Useful for tracking model improvement across releases.
+  #
+  # apply_expm1: null (default) inherits the pipeline's log_target setting.
+  #   Set to true/false to override per model.
+  external_models_evaluation:
+    enable: true                                                  # true = evaluate external models | false = skip
+    models:
+      - name: baseline_model                                      # Label for this model (used as metric suffix)
+        path: "runs:/your_mlflow_run_id/pipeline/"               # MLflow model URI
+        apply_expm1: null                                         # null = inherit log_target from pipeline
+
+# ── 7. Feature Explainability ────────────────────────────────────
+feature_explainability:
+  ebm_html:
+    enable: true                                     # Set to false to skip EBM HTML dashboard
+    dashboard_title: "EBM Global Explainability"     # Title shown in the HTML dashboard
+    max_display_features: 20                         # Number of top features to export as individual HTML pages (0 = summary only)
+  shap:
+    enable: true                    # Set to false to skip SHAP explainability
+    bg_sample_size: 500             # Background samples for SHAP explainer baseline
+    test_sample_size: 5000          # Max test samples to explain (null = all)
+    max_display_features: 20        # Number of top features shown in both plots
+
+# ── 8. Output ────────────────────────────────────────────────────
+output:
+  mlflow:
+    enable: true                   # Set to false to skip MLflow logging entirely
+    experiment_version: "v1.0.0"
+    experiment_name: "qplanner_sac_tmc_models"
+    run_name: "qplanner_sac_tmc_ebm_20250919_20260427"
+    experiment_description: "EBM Model SAC TMC with intentions, equipments and invoice features. Compared to previous EBM (M1 & M2) versions. Note: run performed with Batch Dataproc Docker image."
+    artifact_path: "qp_sac_tmc_mdl"
+    register_model: true            # Set to false to skip MLflow Model Registry registration
+  # Set to "" or remove to disable file logging
+  log_file: "logs/training.log"
